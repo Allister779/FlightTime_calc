@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Example route</name>
+    <Placemark>
+      <name>Pipeline inspection</name>
+      <LineString>
+        <altitudeMode>relativeToGround</altitudeMode>
+        <coordinates>
+          -105.0800,40.5850,0
+          -105.0600,40.6000,120
+          -105.0200,40.6100,120
+          -104.9800,40.6300,120
+          -104.9500,40.6600,120
+          -104.9800,40.6800,120
+        </coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>

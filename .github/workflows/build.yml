@@ -1,0 +1,65 @@
+name: Build standalone apps
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m pytest -q tests
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: FlightTimeCalc-windows-x64.exe
+          - os: macos-latest
+            asset: FlightTimeCalc-macos-apple-silicon.zip
+          - os: macos-15-intel
+            asset: FlightTimeCalc-macos-intel.zip
+          - os: ubuntu-22.04
+            asset: FlightTimeCalc-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: pip install -r requirements-build.txt
+      - name: Build
+        run: python build.py
+      - name: Name the output
+        shell: bash
+        run: |
+          mkdir -p out
+          case "${{ runner.os }}" in
+            Windows) cp dist/FlightTimeCalc.exe "out/${{ matrix.asset }}" ;;
+            macOS)   cp dist/FlightTimeCalc-macos.zip "out/${{ matrix.asset }}" ;;
+            Linux)   cp dist/FlightTimeCalc "out/${{ matrix.asset }}" && chmod +x "out/${{ matrix.asset }}" ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/${{ matrix.asset }}
