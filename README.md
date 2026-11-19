@@ -20,7 +20,10 @@ A desktop app that estimates how long a **fixed-wing** or **VTOL (QuadPlane)** m
   * Best-case and worst-case times for the same wind speed from any direction.
   * An optional check against the aircraft's endurance.
   * A per-leg table showing course, heading (crab angle), ground speed and time. Export it to CSV.
-  * A route map with each leg coloured red if the wind slows it down and green if it speeds it up.
+  * A route map on an open-source base map (**OpenStreetMap** or **OpenTopoMap** terrain). Each leg
+    is coloured red if the wind slows it down and green if it speeds it up. Scroll to zoom, drag to pan.
+* **Metric units by default** (km/h, metres, km). Knots, mph, m/s and feet can be chosen on the
+  *Options* tab.
 
 ## Download and run (no install needed)
 
@@ -83,7 +86,11 @@ The app steps through the mission the way ArduPlane / QuadPlane would fly it:
   return-to-launch, whether the first point is the launch spot, and the altitude to use if the path
   has none.
 
-Settings (units, aircraft and wind) are remembered between runs. Aircraft profiles can be saved and
+Map tiles are cached on your computer for 30 days, so routes you've viewed before still show a map
+when you're offline. With no internet connection and no cached tiles, the route is drawn on a plain
+background.
+
+Settings (units, aircraft, wind and base map) are remembered between runs. Aircraft profiles can be saved and
 loaded as `.json` files for each airframe.
 
 > These are planning estimates. Turns, gusts, turbulence, the autopilot's tuning and battery behaviour
@@ -97,6 +104,7 @@ flighttime/
   estimator.py  mission simulator / flight-time estimate
   wind.py       wind profile and wind-triangle maths
   weather.py    Open-Meteo and NOAA METAR clients
+  basemap.py    OpenStreetMap / OpenTopoMap tile download and cache
   aircraft.py   aircraft performance profiles and presets
   gui.py        Tkinter user interface
 examples/       sample missions to try
@@ -106,3 +114,5 @@ build.py        PyInstaller build script
 
 Weather data: [Open-Meteo.com](https://open-meteo.com) (CC BY 4.0) and
 [NOAA Aviation Weather Center](https://aviationweather.gov).
+Map data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors;
+terrain style © [OpenTopoMap](https://opentopomap.org) (CC-BY-SA).

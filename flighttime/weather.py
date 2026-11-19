@@ -8,6 +8,7 @@
 
 import json
 import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -52,17 +53,29 @@ def _ssl_context():
 
 def _get_json(url, timeout=20):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    host = urllib.parse.urlparse(url).netloc
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
             body = resp.read().decode("utf-8")
-    except Exception as e:  # network errors, HTTP errors, timeouts
-        raise WeatherError("Could not reach %s: %s" % (urllib.parse.urlparse(url).netloc, e))
+    except urllib.error.HTTPError as e:
+        # Services such as Open-Meteo explain refusals (e.g. rate limits) in a JSON "reason".
+        reason = ""
+        try:
+            reason = json.loads(e.read().decode("utf-8")).get("reason", "")
+        except Exception:
+            pass
+        if e.code == 429:
+            raise WeatherError("%s refused the request: %s" % (
+                host, reason or "too many requests. Please try again in a few minutes."))
+        raise WeatherError("%s returned an error (HTTP %d)%s" % (host, e.code, ": " + reason if reason else "."))
+    except Exception as e:  # network errors, timeouts
+        raise WeatherError("Could not reach %s: %s" % (host, e))
     if not body.strip():
         return None
     try:
         return json.loads(body)
     except ValueError:
-        raise WeatherError("Unexpected response from %s" % urllib.parse.urlparse(url).netloc)
+        raise WeatherError("Unexpected response from %s" % host)
 
 
 # ---------------------------------------------------------------------------

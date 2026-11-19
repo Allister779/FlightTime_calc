@@ -168,5 +168,25 @@ class Weather(unittest.TestCase):
         self.assertAlmostEqual(w.speed_ms, 3 * 0.514444)
 
 
+class BaseMap(unittest.TestCase):
+    def test_mercator_round_trip(self):
+        from flighttime import basemap
+        for lat, lon, z in ((40.585, -105.08, 12), (-35.36, 149.17, 15), (0, 0, 3)):
+            x, y = basemap.world_px(lat, lon, z)
+            lat2, lon2 = basemap.latlon_from_px(x, y, z)
+            self.assertAlmostEqual(lat, lat2, places=6)
+            self.assertAlmostEqual(lon, lon2, places=6)
+        # Tile 0/0/0 covers the whole world: lon 0 at the centre.
+        self.assertAlmostEqual(basemap.world_px(0, 0, 0)[0], 128)
+
+    def test_fit_zoom(self):
+        from flighttime import basemap
+        z = basemap.fit_zoom((40.58, -105.08, 40.68, -104.95), 800, 400)
+        x0, y0 = basemap.world_px(40.68, -105.08, z)
+        x1, y1 = basemap.world_px(40.58, -104.95, z)
+        self.assertLessEqual(x1 - x0, 700)
+        self.assertGreater(2 * (x1 - x0), 700 - 1e-6 if 2 * (y1 - y0) <= 300 else 0)
+
+
 if __name__ == "__main__":
     unittest.main()

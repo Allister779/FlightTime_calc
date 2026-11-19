@@ -8,9 +8,12 @@ import queue
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
+from collections import OrderedDict
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
+from . import basemap
 from . import mission as M
 from .aircraft import FIXED_WING, PRESETS, VTOL, AircraftProfile
 from .estimator import direction_sweep, estimate
@@ -51,7 +54,16 @@ AIRCRAFT_FIELDS = [
 
 COLOR_SLOWER = "#d1495b"
 COLOR_FASTER = "#2e933c"
-COLOR_NEUTRAL = "#3a6ea5"
+COLOR_NEUTRAL = "#1f5fbf"
+
+# Tab bar colours (plain tk widgets so the look is identical on Windows, macOS and Linux)
+TAB_ACTIVE_BG = "#1f5fbf"
+TAB_ACTIVE_FG = "#ffffff"
+TAB_IDLE_BG = "#dfe3e8"
+TAB_IDLE_FG = "#2b2f33"
+TAB_HOVER_BG = "#c6ccd4"
+
+SETTINGS_VERSION = 2
 
 
 def settings_path():
@@ -75,6 +87,46 @@ def fmt_delta(seconds):
     return sign + fmt_time(abs(seconds))
 
 
+class TabBar(tk.Frame):
+    """A row of large, clearly-highlighted tab buttons above a content area."""
+
+    def __init__(self, parent, **kw):
+        bg = ttk.Style(parent).lookup("TFrame", "background") or parent.cget("background")
+        super().__init__(parent, background=bg, **kw)
+        base = tkfont.nametofont("TkDefaultFont")
+        self.font = tkfont.Font(family=base.cget("family"), size=max(base.cget("size"), 10) + 1, weight="bold")
+        self.bar = tk.Frame(self, background=bg)
+        self.bar.pack(fill="x")
+        tk.Frame(self, background=TAB_ACTIVE_BG, height=3).pack(fill="x")
+        self.body = tk.Frame(self, background=bg, highlightthickness=1, highlightbackground="#b8bec6",
+                             highlightcolor="#b8bec6")
+        self.body.pack(fill="both", expand=True)
+        self.tabs = []      # (label widget, page)
+        self.current = None
+
+    def add(self, page, text):
+        lbl = tk.Label(self.bar, text=text, font=self.font, padx=16, pady=7, cursor="hand2",
+                       background=TAB_IDLE_BG, foreground=TAB_IDLE_FG)
+        lbl.pack(side="left", padx=(0, 3))
+        idx = len(self.tabs)
+        self.tabs.append((lbl, page))
+        lbl.bind("<Button-1>", lambda e: self.select(idx))
+        lbl.bind("<Enter>", lambda e: idx != self.current and lbl.configure(background=TAB_HOVER_BG))
+        lbl.bind("<Leave>", lambda e: idx != self.current and lbl.configure(background=TAB_IDLE_BG))
+        if self.current is None:
+            self.select(0)
+
+    def select(self, idx):
+        for i, (lbl, page) in enumerate(self.tabs):
+            if i == idx:
+                lbl.configure(background=TAB_ACTIVE_BG, foreground=TAB_ACTIVE_FG)
+                page.pack(in_=self.body, fill="both", expand=True)
+            else:
+                lbl.configure(background=TAB_IDLE_BG, foreground=TAB_IDLE_FG)
+                page.pack_forget()
+        self.current = idx
+
+
 class App:
     def __init__(self, root, initial_file=None):
         self.root = root
@@ -93,9 +145,19 @@ class App:
         self._queue = queue.Queue()
         self._busy = False
 
-        self.speed_unit = tk.StringVar(value="kt")
+        # Base map state
+        self.tiles = basemap.TileLoader()
+        self._tile_images = OrderedDict()
+        self.map_provider = tk.StringVar(value="OpenStreetMap")
+        self.map_zoom = None
+        self.map_center = None           # world-pixel centre at map_zoom
+        self._map_fitted_for = None
+        self._map_redraw_job = None
+        self._drag = None
+
+        self.speed_unit = tk.StringVar(value="km/h")
         self.alt_unit = tk.StringVar(value="m")
-        self._prev_units = ("kt", "m")
+        self._prev_units = ("km/h", "m")
         self._si_cache = {}
         self.kind = tk.StringVar(value=FIXED_WING)
         self.preset = tk.StringVar(value="Generic fixed wing")
@@ -105,7 +167,7 @@ class App:
         self.rtl_vtol_land = tk.BooleanVar(value=True)
         self.endurance = tk.StringVar(value="0")
         self.wind_mode = tk.StringVar(value="single")
-        self.wind_speed = tk.StringVar(value="10")
+        self.wind_speed = tk.StringVar(value="20")
         self.wind_dir = tk.StringVar(value="270")
         self.kml_alt = tk.StringVar(value="100")
         self.kml_takeoff = tk.BooleanVar(value=True)
@@ -126,6 +188,7 @@ class App:
         self._update_wind_mode()
         self._update_unit_labels()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.after(200, self._poll_tiles)
         if initial_file:
             root.after(100, lambda: self.open_file(initial_file))
 
@@ -138,6 +201,7 @@ class App:
         style.configure("Caption.TLabel", foreground="#666666")
         style.configure("Warn.TLabel", foreground="#b35c00")
         style.configure("Treeview", rowheight=22)
+        style.configure("Treeview.Heading", font=("TkDefaultFont", 9, "bold"))
 
     def _build_menu(self):
         menubar = tk.Menu(self.root)
@@ -176,11 +240,12 @@ class App:
 
         left = ttk.Frame(paned, width=360)
         paned.add(left, weight=0)
-        nb = ttk.Notebook(left)
+        nb = TabBar(left)
         nb.pack(fill="both", expand=True)
-        nb.add(self._build_wind_tab(nb), text="Wind")
-        nb.add(self._build_aircraft_tab(nb), text="Aircraft")
-        nb.add(self._build_options_tab(nb), text="Options")
+        self.tabbar = nb
+        nb.add(self._build_wind_tab(nb.body), "Wind")
+        nb.add(self._build_aircraft_tab(nb.body), "Aircraft")
+        nb.add(self._build_options_tab(nb.body), "Options")
 
         right_outer = ttk.Frame(paned)
         paned.add(right_outer, weight=1)
@@ -190,10 +255,28 @@ class App:
         right = ttk.PanedWindow(right_outer, orient="vertical")
         right.pack(fill="both", expand=True)
 
-        self.canvas = tk.Canvas(right, background="#f7f9fb", highlightthickness=1, highlightbackground="#cccccc",
-                                height=260)
-        right.add(self.canvas, weight=1)
+        map_pane = ttk.Frame(right)
+        right.add(map_pane, weight=3)
+        tools = ttk.Frame(map_pane, padding=(0, 0, 0, 4))
+        tools.pack(fill="x")
+        ttk.Label(tools, text="Base map:").pack(side="left")
+        mb = ttk.Combobox(tools, textvariable=self.map_provider, state="readonly", width=22,
+                          values=list(basemap.PROVIDERS) + [basemap.NO_MAP])
+        mb.pack(side="left", padx=4)
+        mb.bind("<<ComboboxSelected>>", lambda e: self._map_provider_changed())
+        ttk.Button(tools, text="Fit route", command=self.fit_map).pack(side="right")
+        ttk.Button(tools, text="+", width=3, command=lambda: self.zoom_map(1)).pack(side="right", padx=(0, 4))
+        ttk.Button(tools, text="−", width=3, command=lambda: self.zoom_map(-1)).pack(side="right", padx=(0, 2))
+        ttk.Label(tools, text="Scroll to zoom · drag to pan", style="Caption.TLabel").pack(side="right", padx=8)
+        self.canvas = tk.Canvas(map_pane, background="#eef1f4", highlightthickness=1,
+                                highlightbackground="#b8bec6", height=300)
+        self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda e: self.draw_map())
+        self.canvas.bind("<ButtonPress-1>", self._map_press)
+        self.canvas.bind("<B1-Motion>", self._map_drag)
+        self.canvas.bind("<MouseWheel>", self._map_wheel)                 # Windows / macOS
+        self.canvas.bind("<Button-4>", lambda e: self._map_wheel(e, 1))   # Linux
+        self.canvas.bind("<Button-5>", lambda e: self._map_wheel(e, -1))
 
         table = ttk.Frame(right)
         right.add(table, weight=1)
@@ -222,22 +305,28 @@ class App:
                   justify="left").pack(anchor="w")
 
     def _build_table(self, parent):
-        cols = ("seg", "dist", "alt", "course", "hdg", "wind", "gs0", "gs1", "t0", "t1", "dt")
+        cols = ("seg", "dist", "alt", "course", "hdg", "wind", "gs0", "gs1", "t0", "t1", "dt", "note")
         self.tree = ttk.Treeview(parent, columns=cols, show="headings", height=8)
-        heads = {"seg": ("Segment", 150), "dist": ("Dist", 52), "alt": ("Alt", 72), "course": ("Course", 62),
-                 "hdg": ("Hdg", 46), "wind": ("Wind", 62), "gs0": ("GS calm", 72), "gs1": ("GS wind", 72),
-                 "t0": ("Time calm", 82), "t1": ("Time wind", 82), "dt": ("Δ", 70)}
+        self.tree_heads = {"seg": ("Segment", 200), "dist": ("Dist", 54), "alt": ("Alt", 72),
+                           "course": ("Course", 60), "hdg": ("Hdg", 46), "wind": ("Wind", 64),
+                           "gs0": ("GS calm", 70), "gs1": ("GS wind", 70), "t0": ("Time calm", 80),
+                           "t1": ("Time wind", 80), "dt": ("Δ", 72), "note": ("Note", 220)}
         for c in cols:
-            title, w = heads[c]
+            title, w = self.tree_heads[c]
             self.tree.heading(c, text=title)
-            self.tree.column(c, width=w, minwidth=40, anchor="w" if c == "seg" else "e", stretch=(c == "seg"))
+            self.tree.column(c, width=w, minwidth=w if c == "seg" else 44,
+                             anchor="w" if c in ("seg", "note") else "e", stretch=(c == "note"))
         self.tree.tag_configure("slower", foreground="#a0182b")
         self.tree.tag_configure("faster", foreground="#1d6b28")
         self.tree.tag_configure("bad", background="#f8d7da")
         sb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        hsb = ttk.Scrollbar(parent, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
 
     def _build_wind_tab(self, nb):
         f = ttk.Frame(nb, padding=10)
@@ -270,7 +359,7 @@ class App:
         g.pack(side="left", fill="y")
         ttk.Label(g, text="Speed").grid(row=0, column=0, sticky="w")
         ttk.Entry(g, textvariable=self.wind_speed, width=8).grid(row=0, column=1, padx=4)
-        self.wind_speed_unit = ttk.Label(g, text="kt")
+        self.wind_speed_unit = ttk.Label(g, text="km/h")
         self.wind_speed_unit.grid(row=0, column=2, sticky="w")
         ttk.Label(g, text="From").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(g, textvariable=self.wind_dir, width=8).grid(row=1, column=1, padx=4, pady=(6, 0))
@@ -653,7 +742,9 @@ class App:
         if err is not None:
             msg = str(err) if isinstance(err, WeatherError) else "Unexpected error: %s" % err
             self.wind_status.set(msg)
-            messagebox.showerror(APP_NAME, msg + "\n\nCheck your internet connection, or enter the wind manually.")
+            hint = ("You can enter the wind manually in the meantime." if "refused" in msg else
+                    "Check your internet connection, or enter the wind manually.")
+            messagebox.showerror(APP_NAME, msg + "\n\n" + hint)
             return
         done(result)
 
@@ -846,6 +937,8 @@ class App:
 
         self.tree.delete(*self.tree.get_children())
         sf, af = self._speed_factor(), self._alt_factor()
+        tree_font = tkfont.nametofont("TkDefaultFont")
+        widest = {"seg": 0, "note": 0}
         for i, (a, b) in enumerate(zip(self.calm.segments, self.windy.segments)):
             alt = (self._num(round(b.alt_end / af)) if abs(b.alt_end - b.alt_start) < 0.5 else
                    "%s→%s" % (self._num(round(b.alt_start / af)), self._num(round(b.alt_end / af))))
@@ -858,7 +951,9 @@ class App:
                 tags = ("slower",)
             elif dt < -0.5:
                 tags = ("faster",)
-            label = b.label + ("  — " + b.note if b.note else "")
+            label = b.label.replace("_", " ")
+            widest["seg"] = max(widest["seg"], tree_font.measure(label))
+            widest["note"] = max(widest["note"], tree_font.measure(b.note))
             self.tree.insert("", "end", values=(
                 label,
                 "%.2f" % (b.distance_m / dfac) if b.distance_m else "",
@@ -868,12 +963,139 @@ class App:
                 wind_txt,
                 "%.0f" % (a.groundspeed / sf) if a.groundspeed else "",
                 "%.0f" % (b.groundspeed / sf) if b.groundspeed else ("—" if b.kind == "leg" else ""),
-                fmt_time(a.time_s), fmt_time(b.time_s), fmt_delta(dt) if abs(dt) >= 0.5 else ""), tags=tags)
+                fmt_time(a.time_s), fmt_time(b.time_s), fmt_delta(dt) if abs(dt) >= 0.5 else "",
+                b.note), tags=tags)
+        # Size the text columns to their longest entry so nothing is cut off.
+        for col, extra in (("seg", 28), ("note", 24)):
+            w = max(self.tree_heads[col][1], widest[col] + extra)
+            self.tree.column(col, width=w, minwidth=w if col == "seg" else 44)
         self.status.set("Calculated %d segments. Wind column: %s / from °. Speeds in %s, heights in %s above launch."
                         % (len(self.windy.segments), self.speed_unit.get(), self.speed_unit.get(),
                            self.alt_unit.get()))
 
     # ------------------------------------------------------------------ map
+    def _provider(self):
+        name = self.map_provider.get()
+        return name if name in basemap.PROVIDERS else None
+
+    def _max_zoom(self):
+        p = self._provider()
+        return basemap.PROVIDERS[p]["max_zoom"] if p else 19
+
+    def _map_bounds(self):
+        m = self.mission
+        lats = [p[0] for p in m.positions()]
+        lons = [p[1] for p in m.positions()]
+        for s in (self.windy.segments if self.windy else []):
+            if s.loiter_radius and s.start:
+                dlat = s.loiter_radius / 111195.0
+                dlon = dlat / max(math.cos(math.radians(s.start[0])), 0.01)
+                lats += [s.start[0] - dlat, s.start[0] + dlat]
+                lons += [s.start[1] - dlon, s.start[1] + dlon]
+        return min(lats), min(lons), max(lats), max(lons)
+
+    def fit_map(self, redraw=True):
+        if not self.mission:
+            return
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if w < 50 or h < 50:
+            return
+        b = self._map_bounds()
+        z = basemap.fit_zoom(b, w, h, margin=60, max_zoom=min(self._max_zoom(), 18))
+        x0, y0 = basemap.world_px(b[2], b[1], z)
+        x1, y1 = basemap.world_px(b[0], b[3], z)
+        self.map_zoom, self.map_center = z, ((x0 + x1) / 2, (y0 + y1) / 2)
+        self._map_fitted_for = id(self.mission)
+        if redraw:
+            self.draw_map()
+
+    def zoom_map(self, dz, sx=None, sy=None):
+        if self.map_zoom is None:
+            return
+        nz = max(2, min(self._max_zoom(), self.map_zoom + dz))
+        if nz == self.map_zoom:
+            return
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        sx = w / 2 if sx is None else sx
+        sy = h / 2 if sy is None else sy
+        f = 2 ** (nz - self.map_zoom)
+        cx, cy = self.map_center
+        # Keep the point under the cursor fixed while zooming.
+        wx, wy = cx + (sx - w / 2), cy + (sy - h / 2)
+        self.map_center = (wx * f - (sx - w / 2), wy * f - (sy - h / 2))
+        self.map_zoom = nz
+        self.tiles.cancel_all()
+        self.draw_map()
+
+    def _map_wheel(self, event, direction=None):
+        if direction is None:
+            direction = 1 if event.delta > 0 else -1
+        self.zoom_map(direction, event.x, event.y)
+
+    def _map_press(self, event):
+        self._drag = (event.x, event.y, self.map_center)
+
+    def _map_drag(self, event):
+        if not self._drag or self.map_center is None:
+            return
+        x0, y0, (cx, cy) = self._drag
+        self.map_center = (cx - (event.x - x0), cy - (event.y - y0))
+        self.draw_map()
+
+    def _map_provider_changed(self):
+        self.tiles.cancel_all()
+        if self.map_zoom is not None and self.map_zoom > self._max_zoom():
+            self.zoom_map(self._max_zoom() - self.map_zoom)
+        else:
+            self.draw_map()
+
+    def _poll_tiles(self):
+        got = False
+        try:
+            while True:
+                key = self.tiles.ready.get_nowait()
+                if key[0] == self._provider() and key[1] == self.map_zoom:
+                    got = True
+        except queue.Empty:
+            pass
+        if got and self._map_redraw_job is None:
+            self._map_redraw_job = self.root.after(60, self._redraw_from_tiles)
+        self.root.after(150, self._poll_tiles)
+
+    def _redraw_from_tiles(self):
+        self._map_redraw_job = None
+        self.draw_map()
+
+    def _tile_image(self, provider, z, x, y):
+        key = (provider, z, x, y)
+        img = self._tile_images.get(key)
+        if img is not None:
+            self._tile_images.move_to_end(key)
+            return img
+        path = self.tiles.cached(provider, z, x, y)
+        if path is None:
+            self.tiles.request(provider, z, x, y)
+            path = self.tiles.stale(provider, z, x, y)   # show an old copy while refreshing
+            if path is None:
+                return None
+        try:
+            img = tk.PhotoImage(file=path)
+        except tk.TclError:
+            return None
+        self._tile_images[key] = img
+        while len(self._tile_images) > 300:
+            self._tile_images.popitem(last=False)
+        return img
+
+    def _label(self, x, y, text, anchor="nw", font=("TkDefaultFont", 9), fg="#222222", bg="#ffffff", pad=3):
+        """Text on a white box so it stays readable over the map."""
+        c = self.canvas
+        t = c.create_text(x, y, text=text, anchor=anchor, font=font, fill=fg)
+        x0, y0, x1, y1 = c.bbox(t)
+        r = c.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad, fill=bg, outline="#9aa3ad")
+        c.tag_lower(r, t)
+        return x0 - pad, y0 - pad, x1 + pad, y1 + pad
+
     def draw_map(self):
         c = self.canvas
         c.delete("all")
@@ -883,40 +1105,41 @@ class App:
         if not self.mission or not self.windy:
             c.create_text(w / 2, h / 2, text="Open a Mission Planner (.waypoints), QGroundControl (.plan),\n"
                                              "KML or KMZ flight plan to see the route here.",
-                          fill="#888888", justify="center", font=("TkDefaultFont", 11))
+                          fill="#666666", justify="center", font=("TkDefaultFont", 11))
             return
-        m = self.mission
-        lat0 = m.home_lat
-        kx = 111195.0 * math.cos(math.radians(lat0))
-        ky = 111195.0
+        if self._map_fitted_for != id(self.mission) or self.map_zoom is None:
+            self.fit_map(redraw=False)
+        m, z = self.mission, self.map_zoom
+        cx, cy = self.map_center
+        ox, oy = cx - w / 2, cy - h / 2
 
-        def proj(lat, lon):
-            return (lon - m.home_lon) * kx, (lat - m.home_lat) * ky
-
-        pts = [proj(*p) for p in m.positions()]
-        for s in self.windy.segments:
-            if s.loiter_radius:
-                x, y = proj(*s.start)
-                pts += [(x - s.loiter_radius, y - s.loiter_radius), (x + s.loiter_radius, y + s.loiter_radius)]
-        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-        span = max(max(xs) - min(xs), max(ys) - min(ys), 50.0)
-        margin = 45
-        scale = min((w - 2 * margin) / max(max(xs) - min(xs), 1e-6) if max(xs) > min(xs) else 1e9,
-                    (h - 2 * margin) / max(max(ys) - min(ys), 1e-6) if max(ys) > min(ys) else 1e9,
-                    (min(w, h) - 2 * margin) / span)
-        cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+        # --- base map tiles
+        provider = self._provider()
+        if provider:
+            n = 2 ** z
+            for ty in range(int(oy // 256), int((oy + h) // 256) + 1):
+                if ty < 0 or ty >= n:
+                    continue
+                for tx in range(int(ox // 256), int((ox + w) // 256) + 1):
+                    img = self._tile_image(provider, z, tx % n, ty)
+                    if img is not None:
+                        c.create_image(tx * 256 - ox, ty * 256 - oy, image=img, anchor="nw")
 
         def scr(lat, lon):
-            x, y = proj(lat, lon)
-            return w / 2 + (x - cx) * scale, h / 2 - (y - cy) * scale
+            x, y = basemap.world_px(lat, lon, z)
+            return x - ox, y - oy
 
+        mpp = basemap.metres_per_px(m.home_lat, z)
+
+        # --- route (white casing under each line keeps it visible on any map)
         for a, b in zip(self.calm.segments, self.windy.segments):
             if b.start is None or b.end is None:
                 continue
             if b.loiter_radius:
                 x, y = scr(*b.start)
-                r = b.loiter_radius * scale
-                c.create_oval(x - r, y - r, x + r, y + r, outline="#7d5ba6", dash=(4, 3), width=2)
+                r = b.loiter_radius / mpp
+                c.create_oval(x - r, y - r, x + r, y + r, outline="#ffffff", width=5)
+                c.create_oval(x - r, y - r, x + r, y + r, outline="#7d3cb5", dash=(6, 4), width=3)
                 continue
             if b.distance_m < 0.5:
                 continue
@@ -924,46 +1147,73 @@ class App:
             color = COLOR_SLOWER if ratio > 1.03 else (COLOR_FASTER if ratio < 0.97 else COLOR_NEUTRAL)
             if not math.isfinite(b.time_s):
                 color = "#000000"
-            width = 3 if math.isfinite(ratio) and abs(ratio - 1) > 0.15 else 2
             x0, y0 = scr(*b.start)
             x1, y1 = scr(*b.end)
-            c.create_line(x0, y0, x1, y1, fill=color, width=width, arrow="last", arrowshape=(9, 11, 4))
+            c.create_line(x0, y0, x1, y1, fill="#ffffff", width=8, capstyle="round")
+            c.create_line(x0, y0, x1, y1, fill=color, width=4, arrow="last", arrowshape=(13, 16, 6))
 
         for it in m.items:
             if it.has_position and it.command not in (M.DO_JUMP, M.DO_CHANGE_SPEED):
                 x, y = scr(it.lat, it.lon)
-                c.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#ffffff", outline="#333333")
-                c.create_text(x + 7, y - 7, text=str(it.seq), anchor="sw", font=("TkDefaultFont", 8), fill="#333333")
+                c.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#ffffff", outline="#222222", width=2)
+                self._label(x + 8, y - 8, str(it.seq), anchor="sw", font=("TkDefaultFont", 8, "bold"), pad=1)
         hx, hy = scr(m.home_lat, m.home_lon)
-        c.create_polygon(hx, hy - 9, hx - 8, hy + 6, hx + 8, hy + 6, fill="#f2b134", outline="#7a5600")
-        c.create_text(hx, hy + 8, text="H", anchor="n", font=("TkDefaultFont", 8, "bold"))
+        c.create_polygon(hx, hy - 11, hx - 9, hy + 7, hx + 9, hy + 7, fill="#f2b134", outline="#5a3f00", width=2)
+        self._label(hx, hy + 10, "Launch", anchor="n", font=("TkDefaultFont", 8, "bold"), pad=1)
 
-        # Legend, north arrow, scale bar, wind arrow
-        c.create_text(12, 12, anchor="nw", fill="#555555", font=("TkDefaultFont", 9),
-                      text="Leg colour: red = slower with wind, green = faster, blue = little change")
-        c.create_text(w - 22, 18, text="N", font=("TkDefaultFont", 10, "bold"))
-        c.create_line(w - 22, 50, w - 22, 28, arrow="last", width=2)
-        nice = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]
-        target = (w * 0.2) / scale
-        seg_m = max([n for n in nice if n <= target] or [nice[0]])
-        px = seg_m * scale
-        c.create_line(12, h - 14, 12 + px, h - 14, width=3, fill="#444444")
-        c.create_text(12 + px + 6, h - 14, anchor="w", font=("TkDefaultFont", 8),
-                      text=("%g km" % (seg_m / 1000)) if seg_m >= 1000 else "%d m" % seg_m)
+        # --- overlays: legend, north, wind, scale, attribution
+        font = tkfont.Font(family=tkfont.nametofont("TkDefaultFont").cget("family"), size=9)
+        lx, ly, lh = 10, 10, 22
+        box = c.create_rectangle(lx, ly, lx, ly + lh, fill="#ffffff", outline="#9aa3ad")
+        x = lx + 6
+        c.create_text(x, ly + lh / 2, text="Legs:", anchor="w", font=("TkDefaultFont", 9, "bold"))
+        x += font.measure("Legs:") + 12
+        for col, txt in ((COLOR_SLOWER, "slower with wind"), (COLOR_FASTER, "faster"),
+                         (COLOR_NEUTRAL, "little change")):
+            c.create_line(x, ly + lh / 2, x + 18, ly + lh / 2, fill=col, width=4)
+            x += 23
+            c.create_text(x, ly + lh / 2, text=txt, anchor="w", font=font)
+            x += font.measure(txt) + 14
+        c.coords(box, lx, ly, x - 6, ly + lh)
+
+        c.create_oval(w - 38, 8, w - 8, 38, fill="#ffffff", outline="#9aa3ad")
+        c.create_line(w - 23, 33, w - 23, 15, arrow="last", width=2, arrowshape=(7, 8, 3))
+        c.create_text(w - 23, 44, text="N", font=("TkDefaultFont", 9, "bold"), anchor="n")
+
+        nice = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000]
+        target = (w * 0.18) * mpp
+        seg_m = max([v for v in nice if v <= target] or [nice[0]])
+        px = seg_m / mpp
+        sb_text = ("%g km" % (seg_m / 1000)) if seg_m >= 1000 else "%d m" % seg_m
+        c.create_rectangle(6, h - 30, 22 + px + font.measure(sb_text) + 8, h - 6, fill="#ffffff", outline="#9aa3ad")
+        c.create_line(12, h - 18, 12 + px, h - 18, width=4, fill="#333333")
+        c.create_line(12, h - 23, 12, h - 13, width=2, fill="#333333")
+        c.create_line(12 + px, h - 23, 12 + px, h - 13, width=2, fill="#333333")
+        c.create_text(18 + px, h - 18, anchor="w", font=("TkDefaultFont", 8), text=sb_text)
+
+        if provider:
+            attr = basemap.PROVIDERS[provider]["attribution"]
+            if self.tiles.errors and not self.tiles.successes and not self._tile_images:
+                attr = "Base map unavailable (offline?) · " + attr
+            self._label(w - 4, h - 4, attr, anchor="se", font=("TkDefaultFont", 8), pad=2)
+
         try:
             wind = self.read_wind()
         except ValueError:
             wind = None
         if wind and not wind.is_calm():
             s, d = wind.at(self._typical_alt())
-            ax, ay = w - 70, h - 50
+            text = "Wind %.0f %s from %03d°" % (s / self._speed_factor(), self.speed_unit.get(), round(d) % 360)
+            bw = max(font.measure(text) + 16, 90)
+            bx1, by0 = w - 8, 70
+            bx0, by1 = bx1 - bw, by0 + 80
+            c.create_rectangle(bx0, by0, bx1, by1, fill="#ffffff", outline="#9aa3ad")
+            ax, ay = (bx0 + bx1) / 2, by0 + 34
             a = math.radians(d + 180)
             L = 24
             c.create_line(ax - L * math.sin(a), ay + L * math.cos(a), ax + L * math.sin(a), ay - L * math.cos(a),
-                          arrow="last", width=4, fill=COLOR_NEUTRAL, arrowshape=(12, 14, 6))
-            c.create_text(w - 10, h - 12, anchor="e", text="Wind %.0f %s from %03d°" % (s / self._speed_factor(),
-                                                                          self.speed_unit.get(), round(d) % 360),
-                          font=("TkDefaultFont", 9))
+                          arrow="last", width=5, fill=COLOR_NEUTRAL, arrowshape=(13, 16, 7))
+            c.create_text(ax, by1 - 6, text=text, anchor="s", font=("TkDefaultFont", 9, "bold"))
 
     # ------------------------------------------------------------------ export / help
     def export_csv(self):
@@ -1024,15 +1274,21 @@ class App:
         except Exception:
             return
         try:
-            self.speed_unit.set(s.get("speed_unit", "kt"))
-            self.alt_unit.set(s.get("alt_unit", "m"))
-            self._prev_units = (self.speed_unit.get(), self.alt_unit.get())
+            # Settings from version 1 defaulted to knots; start those users on metric units.
+            current = s.get("settings_version", 1) >= SETTINGS_VERSION
+            if current:
+                self.speed_unit.set(s.get("speed_unit", "km/h"))
+                self.alt_unit.set(s.get("alt_unit", "m"))
+                self._prev_units = (self.speed_unit.get(), self.alt_unit.get())
             if "aircraft" in s:
                 self.preset.set(s["aircraft"].get("name", self.preset.get()))
                 self._apply_profile(AircraftProfile.from_dict(s["aircraft"]))
-            self.wind_speed.set(s.get("wind_speed", self.wind_speed.get()))
+            if current:
+                self.wind_speed.set(s.get("wind_speed", self.wind_speed.get()))
+                self.kml_alt.set(s.get("kml_alt", self.kml_alt.get()))
             self.wind_dir.set(s.get("wind_dir", self.wind_dir.get()))
-            self.kml_alt.set(s.get("kml_alt", self.kml_alt.get()))
+            if s.get("map_provider") in list(basemap.PROVIDERS) + [basemap.NO_MAP]:
+                self.map_provider.set(s["map_provider"])
             self.kml_takeoff.set(s.get("kml_takeoff", True))
             self.kml_rtl.set(s.get("kml_rtl", True))
             self.kml_first_is_launch.set(s.get("kml_first_is_launch", True))
@@ -1043,7 +1299,8 @@ class App:
             pass
 
     def _save_settings(self):
-        s = {"speed_unit": self.speed_unit.get(), "alt_unit": self.alt_unit.get(),
+        s = {"settings_version": SETTINGS_VERSION, "map_provider": self.map_provider.get(),
+             "speed_unit": self.speed_unit.get(), "alt_unit": self.alt_unit.get(),
              "wind_speed": self.wind_speed.get(), "wind_dir": self.wind_dir.get(),
              "kml_alt": self.kml_alt.get(), "kml_takeoff": self.kml_takeoff.get(), "kml_rtl": self.kml_rtl.get(),
              "kml_first_is_launch": self.kml_first_is_launch.get(), "geometry": self.root.geometry()}
