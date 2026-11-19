@@ -8,12 +8,12 @@ import queue
 import sys
 import threading
 import tkinter as tk
-import tkinter.font as tkfont
 from collections import OrderedDict
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
 from . import basemap
+from . import theme
 from . import mission as M
 from .aircraft import FIXED_WING, PRESETS, VTOL, AircraftProfile
 from .estimator import direction_sweep, estimate
@@ -56,14 +56,11 @@ COLOR_SLOWER = "#d1495b"
 COLOR_FASTER = "#2e933c"
 COLOR_NEUTRAL = "#1f5fbf"
 
-# Tab bar colours (plain tk widgets so the look is identical on Windows, macOS and Linux)
-TAB_ACTIVE_BG = "#1f5fbf"
-TAB_ACTIVE_FG = "#ffffff"
-TAB_IDLE_BG = "#dfe3e8"
-TAB_IDLE_FG = "#2b2f33"
-TAB_HOVER_BG = "#c6ccd4"
-
 SETTINGS_VERSION = 2
+
+# Sample cell contents used to size table columns from the real font (so they fit at any DPI).
+TREE_SAMPLES = {"dist": "999.99", "alt": "999→999", "crs": "000/000", "wind": "100/360",
+                "gs0": "999", "gs1": "999", "t0": "0:00:00", "t1": "0:00:00", "dt": "+0:00:00"}
 
 
 def settings_path():
@@ -88,43 +85,58 @@ def fmt_delta(seconds):
 
 
 class TabBar(tk.Frame):
-    """A row of large, clearly-highlighted tab buttons above a content area."""
+    """A row of large, clearly-highlighted tab buttons above a content area.
 
-    def __init__(self, parent, **kw):
-        bg = ttk.Style(parent).lookup("TFrame", "background") or parent.cget("background")
-        super().__init__(parent, background=bg, **kw)
-        base = tkfont.nametofont("TkDefaultFont")
-        self.font = tkfont.Font(family=base.cget("family"), size=max(base.cget("size"), 10) + 1, weight="bold")
-        self.bar = tk.Frame(self, background=bg)
+    Plain tk widgets are used so the look is identical on Windows, macOS and Linux.
+    """
+
+    def __init__(self, parent, font, palette, **kw):
+        super().__init__(parent, **kw)
+        self.font = font
+        self.p = palette
+        self.bar = tk.Frame(self)
         self.bar.pack(fill="x")
-        tk.Frame(self, background=TAB_ACTIVE_BG, height=3).pack(fill="x")
-        self.body = tk.Frame(self, background=bg, highlightthickness=1, highlightbackground="#b8bec6",
-                             highlightcolor="#b8bec6")
+        self.rule = tk.Frame(self, height=3)
+        self.rule.pack(fill="x")
+        self.body = tk.Frame(self, highlightthickness=1)
         self.body.pack(fill="both", expand=True)
         self.tabs = []      # (label widget, page)
         self.current = None
+        self.restyle(palette)
 
     def add(self, page, text):
-        lbl = tk.Label(self.bar, text=text, font=self.font, padx=16, pady=7, cursor="hand2",
-                       background=TAB_IDLE_BG, foreground=TAB_IDLE_FG)
+        lbl = tk.Label(self.bar, text=text, font=self.font, padx=16, pady=7, cursor="hand2")
         lbl.pack(side="left", padx=(0, 3))
         idx = len(self.tabs)
         self.tabs.append((lbl, page))
         lbl.bind("<Button-1>", lambda e: self.select(idx))
-        lbl.bind("<Enter>", lambda e: idx != self.current and lbl.configure(background=TAB_HOVER_BG))
-        lbl.bind("<Leave>", lambda e: idx != self.current and lbl.configure(background=TAB_IDLE_BG))
+        lbl.bind("<Enter>", lambda e: idx != self.current and lbl.configure(background=self.p["tab_hover_bg"]))
+        lbl.bind("<Leave>", lambda e: idx != self.current and lbl.configure(background=self.p["tab_idle_bg"]))
         if self.current is None:
             self.select(0)
+        else:
+            self.select(self.current)
 
     def select(self, idx):
+        p = self.p
         for i, (lbl, page) in enumerate(self.tabs):
             if i == idx:
-                lbl.configure(background=TAB_ACTIVE_BG, foreground=TAB_ACTIVE_FG)
+                lbl.configure(background=p["tab_active_bg"], foreground=p["tab_active_fg"])
                 page.pack(in_=self.body, fill="both", expand=True)
             else:
-                lbl.configure(background=TAB_IDLE_BG, foreground=TAB_IDLE_FG)
+                lbl.configure(background=p["tab_idle_bg"], foreground=p["tab_idle_fg"])
                 page.pack_forget()
         self.current = idx
+
+    def restyle(self, palette):
+        self.p = palette
+        for w in (self, self.bar):
+            w.configure(background=palette["bg"])
+        self.rule.configure(background=palette["tab_active_bg"])
+        self.body.configure(background=palette["bg"], highlightbackground=palette["border"],
+                            highlightcolor=palette["border"])
+        if self.current is not None:
+            self.select(self.current)
 
 
 class App:
@@ -132,6 +144,10 @@ class App:
         self.root = root
         root.title("%s %s" % (APP_NAME, __version__))
         root.minsize(1000, 640)
+        self.fonts = theme.Fonts(root)
+        self.scale = theme.ui_scale(root)
+        self.appearance = tk.StringVar(value="System")
+        self.pal = theme.LIGHT
 
         self.mission = None
         self.routes = []
@@ -178,34 +194,72 @@ class App:
         self.status = tk.StringVar(value="Open a flight plan to begin.")
         self.wind_status = tk.StringVar(value="Winds can be fetched for the mission area once a flight plan is loaded.")
 
-        self._setup_style()
         self._build_menu()
         self._build_layout()
         self._apply_profile(PRESETS["Generic fixed wing"])
         self._load_settings()
+        self.apply_theme()
         self._watch_inputs()
         self._update_kind_visibility()
         self._update_wind_mode()
         self._update_unit_labels()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(200, self._poll_tiles)
+        root.after(5000, self._poll_system_theme)
         if initial_file:
             root.after(100, lambda: self.open_file(initial_file))
 
     # ------------------------------------------------------------------ UI build
-    def _setup_style(self):
-        style = ttk.Style(self.root)
-        if sys.platform.startswith("linux") and "clam" in style.theme_names():
-            style.theme_use("clam")
-        style.configure("Big.TLabel", font=("TkDefaultFont", 16, "bold"))
-        style.configure("Caption.TLabel", foreground="#666666")
-        style.configure("Warn.TLabel", foreground="#b35c00")
-        style.configure("Treeview", rowheight=22)
-        style.configure("Treeview.Heading", font=("TkDefaultFont", 9, "bold"))
+    def apply_theme(self):
+        """Apply the chosen appearance (light, dark or following the system) to every widget."""
+        self.pal = p = theme.resolve(self.appearance.get())
+        theme.apply(self.root, p, self.fonts, self._find(ttk.Combobox))
+        self.tabbar.restyle(p)
+        self.canvas.configure(background=p["map_bg"], highlightbackground=p["border"])
+        self.dial.configure(background=p["bg"])
+        for menu in self.menus:
+            menu.configure(background=p["surface"], foreground=p["fg"], activebackground=p["select_bg"],
+                           activeforeground=p["select_fg"], selectcolor=p["fg"])
+        self.tree.tag_configure("slower", foreground=p["slower"])
+        self.tree.tag_configure("faster", foreground=p["faster"])
+        self.tree.tag_configure("bad", background=p["bad_bg"])
+        self._size_tree_columns()
+        self.draw_dial()
+        self.draw_map()
+
+    def _poll_system_theme(self):
+        """In 'System' mode, follow the OS if the user switches light/dark while the app is open."""
+        if self.appearance.get() == "System" and theme.resolve("System")["name"] != self.pal["name"]:
+            self.apply_theme()
+        self.root.after(5000, self._poll_system_theme)
+
+    def _find(self, cls, widget=None):
+        widget = widget or self.root
+        found = [widget] if isinstance(widget, cls) else []
+        for child in widget.winfo_children():
+            found += self._find(cls, child)
+        return found
+
+    def _size_tree_columns(self):
+        """Column widths from the actual font so headings and values fit at any display scaling."""
+        f = self.fonts.normal
+        for col, sample in TREE_SAMPLES.items():
+            w = max(f.measure(self.tree_heads[col][0]) + 18, f.measure(sample) + 10)
+            self.tree.column(col, width=w, minwidth=w)
+        for col in ("seg", "note"):
+            w = max(f.measure(self.tree_heads[col][0]) + 18, self._text_widths.get(col, 0))
+            if col == "note":
+                w = max(w, int(self.tree_heads[col][1] * self.scale))
+            self.tree.column(col, width=w, minwidth=w if col == "seg" else 44)
+        for col, title, sample in (("alt", "Height (ft)", "10000"), ("spd", "Speed (km/h)", "100.0"),
+                                   ("dir", "From °", "360")):
+            w = max(f.measure(title) + 22, f.measure(sample) + 16)
+            self.layer_tree.column(col, width=w, minwidth=w)
 
     def _build_menu(self):
         menubar = tk.Menu(self.root)
         fm = tk.Menu(menubar, tearoff=False)
+        vm = tk.Menu(menubar, tearoff=False)
         fm.add_command(label="Open flight plan…", command=self.choose_file, accelerator="Ctrl+O")
         fm.add_command(label="Export results to CSV…", command=self.export_csv)
         fm.add_separator()
@@ -214,10 +268,15 @@ class App:
         fm.add_separator()
         fm.add_command(label="Quit", command=self._on_close)
         menubar.add_cascade(label="File", menu=fm)
+        for name in theme.APPEARANCES:
+            vm.add_radiobutton(label="%s appearance" % name, value=name, variable=self.appearance,
+                               command=self.apply_theme)
+        menubar.add_cascade(label="View", menu=vm)
         hm = tk.Menu(menubar, tearoff=False)
         hm.add_command(label="How the estimate works", command=self.show_help)
         hm.add_command(label="About", command=self.show_about)
         menubar.add_cascade(label="Help", menu=hm)
+        self.menus = [menubar, fm, vm, hm]
         self.root.config(menu=menubar)
         self.root.bind_all("<Control-o>", lambda e: self.choose_file())
         self.root.bind_all("<Command-o>", lambda e: self.choose_file())
@@ -235,12 +294,16 @@ class App:
         self.route_box.bind("<<ComboboxSelected>>", lambda e: self._rebuild_route_mission())
         ttk.Button(top, text="Calculate", command=self.recalculate).pack(side="right")
 
+        bar = ttk.Frame(self.root, padding=(10, 2, 10, 6))
+        bar.pack(side="bottom", fill="x")
+        ttk.Label(bar, textvariable=self.status, style="Caption.TLabel").pack(side="left")
+
         paned = ttk.PanedWindow(self.root, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
         left = ttk.Frame(paned, width=360)
         paned.add(left, weight=0)
-        nb = TabBar(left)
+        nb = TabBar(left, self.fonts.tab, self.pal)
         nb.pack(fill="both", expand=True)
         self.tabbar = nb
         nb.add(self._build_wind_tab(nb.body), "Wind")
@@ -268,8 +331,7 @@ class App:
         ttk.Button(tools, text="+", width=3, command=lambda: self.zoom_map(1)).pack(side="right", padx=(0, 4))
         ttk.Button(tools, text="−", width=3, command=lambda: self.zoom_map(-1)).pack(side="right", padx=(0, 2))
         ttk.Label(tools, text="Scroll to zoom · drag to pan", style="Caption.TLabel").pack(side="right", padx=8)
-        self.canvas = tk.Canvas(map_pane, background="#eef1f4", highlightthickness=1,
-                                highlightbackground="#b8bec6", height=300)
+        self.canvas = tk.Canvas(map_pane, highlightthickness=1, height=int(260 * self.scale))
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda e: self.draw_map())
         self.canvas.bind("<ButtonPress-1>", self._map_press)
@@ -281,10 +343,6 @@ class App:
         table = ttk.Frame(right)
         right.add(table, weight=1)
         self._build_table(table)
-
-        bar = ttk.Frame(self.root, padding=(10, 2, 10, 6))
-        bar.pack(fill="x")
-        ttk.Label(bar, textvariable=self.status, style="Caption.TLabel").pack(side="left")
 
     def _build_summary(self, parent):
         grid = ttk.Frame(parent)
@@ -299,16 +357,19 @@ class App:
             self.sum_vars[key] = v
             ttk.Label(box, textvariable=v, style="Big.TLabel").pack(anchor="w")
         self.detail_var = tk.StringVar(value="")
-        ttk.Label(parent, textvariable=self.detail_var, wraplength=700, justify="left").pack(anchor="w", pady=(4, 0))
+        detail = ttk.Label(parent, textvariable=self.detail_var, justify="left")
+        detail.pack(anchor="w", pady=(4, 0))
         self.warn_var = tk.StringVar(value="")
-        ttk.Label(parent, textvariable=self.warn_var, style="Warn.TLabel", wraplength=700,
-                  justify="left").pack(anchor="w")
+        warn = ttk.Label(parent, textvariable=self.warn_var, style="Warn.TLabel", justify="left")
+        warn.pack(anchor="w")
+        parent.bind("<Configure>", lambda e: (detail.configure(wraplength=max(e.width - 20, 200)),
+                                              warn.configure(wraplength=max(e.width - 20, 200))))
 
     def _build_table(self, parent):
-        cols = ("seg", "dist", "alt", "course", "hdg", "wind", "gs0", "gs1", "t0", "t1", "dt", "note")
+        cols = ("seg", "dist", "alt", "crs", "wind", "gs0", "gs1", "t0", "t1", "dt", "note")
         self.tree = ttk.Treeview(parent, columns=cols, show="headings", height=8)
         self.tree_heads = {"seg": ("Segment", 200), "dist": ("Dist", 54), "alt": ("Alt", 72),
-                           "course": ("Course", 60), "hdg": ("Hdg", 46), "wind": ("Wind", 64),
+                           "crs": ("Crs/Hdg", 70), "wind": ("Wind", 64),
                            "gs0": ("GS calm", 70), "gs1": ("GS wind", 70), "t0": ("Time calm", 80),
                            "t1": ("Time wind", 80), "dt": ("Δ", 72), "note": ("Note", 220)}
         for c in cols:
@@ -316,9 +377,7 @@ class App:
             self.tree.heading(c, text=title)
             self.tree.column(c, width=w, minwidth=w if c == "seg" else 44,
                              anchor="w" if c in ("seg", "note") else "e", stretch=(c == "note"))
-        self.tree.tag_configure("slower", foreground="#a0182b")
-        self.tree.tag_configure("faster", foreground="#1d6b28")
-        self.tree.tag_configure("bad", background="#f8d7da")
+        self._text_widths = {}
         sb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(parent, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
@@ -333,10 +392,10 @@ class App:
 
         live = ttk.LabelFrame(f, text="Get current winds for the mission area", padding=8)
         live.pack(fill="x")
-        self.btn_meteo = ttk.Button(live, text="Forecast winds aloft (Open-Meteo, worldwide)",
+        self.btn_meteo = ttk.Button(live, text="Forecast winds aloft (Open-Meteo)",
                                     command=self.fetch_forecast)
         self.btn_meteo.pack(fill="x")
-        self.btn_metar = ttk.Button(live, text="Nearest airport observation (NOAA METAR)", command=self.fetch_metar)
+        self.btn_metar = ttk.Button(live, text="Nearest airport wind (NOAA METAR)", command=self.fetch_metar)
         self.btn_metar.pack(fill="x", pady=(4, 0))
         row = ttk.Frame(live)
         row.pack(fill="x", pady=(6, 0))
@@ -344,7 +403,7 @@ class App:
         self.forecast_box = ttk.Combobox(row, textvariable=self.forecast_choice, state="disabled", width=18)
         self.forecast_box.pack(side="left", padx=4)
         self.forecast_box.bind("<<ComboboxSelected>>", lambda e: self._apply_forecast_hour())
-        ttk.Label(live, textvariable=self.wind_status, wraplength=320, justify="left",
+        ttk.Label(live, textvariable=self.wind_status, wraplength=int(270 * self.scale), justify="left",
                   style="Caption.TLabel").pack(anchor="w", pady=(6, 0))
 
         mode = ttk.Frame(f)
@@ -366,27 +425,32 @@ class App:
         ttk.Label(g, text="° true").grid(row=1, column=2, sticky="w", pady=(6, 0))
         ttk.Label(g, text="Click the dial to set\nthe direction the wind\nis coming FROM.",
                   style="Caption.TLabel").grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        self.dial = tk.Canvas(self.single_frame, width=120, height=120, highlightthickness=0,
-                              background=self.root.cget("background") if sys.platform != "darwin" else "#ececec")
+        self.dial_size = int(120 * self.scale)
+        self.dial = tk.Canvas(self.single_frame, width=self.dial_size, height=self.dial_size, highlightthickness=0)
         self.dial.pack(side="right")
         self.dial.bind("<Button-1>", self._dial_click)
         self.dial.bind("<B1-Motion>", self._dial_click)
 
         self.layers_frame = ttk.LabelFrame(f, text="Wind layers (height above launch)", padding=8)
-        self.layer_tree = ttk.Treeview(self.layers_frame, columns=("alt", "spd", "dir"), show="headings", height=7)
+        self.layer_tree = ttk.Treeview(self.layers_frame, columns=("alt", "spd", "dir"), show="headings", height=5)
         for c, t in (("alt", "Height"), ("spd", "Speed"), ("dir", "From °")):
             self.layer_tree.heading(c, text=t)
-            self.layer_tree.column(c, width=90, anchor="e")
+            self.layer_tree.column(c, width=int(90 * self.scale), anchor="e")
         self.layer_tree.pack(fill="x")
-        add = ttk.Frame(self.layers_frame)
+        ttk.Button(self.layers_frame, text="Remove selected layer", command=self._remove_layer
+                   ).pack(anchor="e", pady=(4, 0))
+        add = ttk.LabelFrame(self.layers_frame, text="Add a layer", padding=6)
         add.pack(fill="x", pady=(6, 0))
         self.new_alt, self.new_spd, self.new_dir = tk.StringVar(), tk.StringVar(), tk.StringVar()
-        for var, w in ((self.new_alt, 6), (self.new_spd, 6), (self.new_dir, 6)):
-            ttk.Entry(add, textvariable=var, width=w).pack(side="left", padx=(0, 4))
-        ttk.Button(add, text="Add", command=self._add_layer, width=6).pack(side="left")
-        ttk.Button(add, text="Remove", command=self._remove_layer).pack(side="left", padx=(4, 0))
-        self.layer_hint = ttk.Label(self.layers_frame, text="", style="Caption.TLabel")
-        self.layer_hint.pack(anchor="w", pady=(4, 0))
+        self.layer_entry_labels = []
+        for col, var in enumerate((self.new_alt, self.new_spd, self.new_dir)):
+            lbl = ttk.Label(add, text="", style="Caption.TLabel")
+            lbl.grid(row=0, column=col, sticky="w", padx=(0, 4))
+            self.layer_entry_labels.append(lbl)
+            ttk.Entry(add, textvariable=var, width=7).grid(row=1, column=col, sticky="ew", padx=(0, 4))
+            add.columnconfigure(col, weight=1)
+        ttk.Button(add, text="Add layer", command=self._add_layer).grid(row=2, column=0, columnspan=3, sticky="e",
+                                                                       pady=(6, 0))
         return f
 
     def _build_aircraft_tab(self, nb):
@@ -440,6 +504,12 @@ class App:
 
     def _build_options_tab(self, nb):
         f = ttk.Frame(nb, padding=10)
+        look = ttk.LabelFrame(f, text="Appearance", padding=8)
+        look.pack(fill="x", pady=(0, 10))
+        for name, desc in (("System", "System (follow the computer's setting)"), ("Light", "Light"),
+                           ("Dark", "Dark")):
+            ttk.Radiobutton(look, text=desc, value=name, variable=self.appearance,
+                            command=self.apply_theme).pack(anchor="w")
         units = ttk.LabelFrame(f, text="Units", padding=8)
         units.pack(fill="x")
         ttk.Label(units, text="Speed").grid(row=0, column=0, sticky="w")
@@ -464,7 +534,7 @@ class App:
                             ).grid(row=r, column=0, columnspan=3, sticky="w")
         ttk.Label(f, text="Mission Planner (.waypoints) and QGroundControl (.plan) files are used exactly as "
                           "written: take-off, loiters, DO_JUMP loops, speed changes, VTOL transitions and "
-                          "landing are all simulated.", wraplength=320, style="Caption.TLabel",
+                          "landing are all simulated.", wraplength=int(270 * self.scale), style="Caption.TLabel",
                   justify="left").pack(anchor="w", pady=(10, 0))
         return f
 
@@ -530,8 +600,9 @@ class App:
         self.kml_alt_unit.configure(text=self.alt_unit.get())
         self.layer_tree.heading("alt", text="Height (%s)" % self.alt_unit.get())
         self.layer_tree.heading("spd", text="Speed (%s)" % self.speed_unit.get())
-        self.layer_hint.configure(text="New layer: height, speed, from-direction (%s, %s, °)"
-                                       % (self.alt_unit.get(), self.speed_unit.get()))
+        for lbl, txt in zip(self.layer_entry_labels, ("Height (%s)" % self.alt_unit.get(),
+                                                      "Speed (%s)" % self.speed_unit.get(), "From (°)")):
+            lbl.configure(text=txt)
 
     # ------------------------------------------------------------------ aircraft
     def _apply_profile(self, p: AircraftProfile):
@@ -627,17 +698,18 @@ class App:
     def draw_dial(self):
         c = self.dial
         c.delete("all")
-        cx = cy = 60
-        r = 46
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#888888", width=2, fill="#ffffff")
+        p = self.pal
+        cx = cy = self.dial_size / 2
+        r = self.dial_size * 0.38
+        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=p["dial_ring"], width=2, fill=p["dial_face"])
         for ang, txt in ((0, "N"), (90, "E"), (180, "S"), (270, "W")):
             a = math.radians(ang)
             c.create_text(cx + (r + 9) * math.sin(a), cy - (r + 9) * math.cos(a), text=txt,
-                          font=("TkDefaultFont", 8, "bold"))
+                          font=self.fonts.small_bold, fill=p["fg"])
         for ang in range(0, 360, 30):
             a = math.radians(ang)
             c.create_line(cx + (r - 5) * math.sin(a), cy - (r - 5) * math.cos(a),
-                          cx + r * math.sin(a), cy - r * math.cos(a), fill="#999999")
+                          cx + r * math.sin(a), cy - r * math.cos(a), fill=p["dial_tick"])
         try:
             d = float(self.wind_dir.get())
         except ValueError:
@@ -649,7 +721,8 @@ class App:
         c.create_line(x0, y0, x1, y1, arrow="last", width=3, fill=COLOR_NEUTRAL, arrowshape=(12, 14, 5))
 
     def _dial_click(self, event):
-        d = math.degrees(math.atan2(event.x - 60, 60 - event.y)) % 360
+        half = self.dial_size / 2
+        d = math.degrees(math.atan2(event.x - half, half - event.y)) % 360
         self.wind_dir.set(str(int(round(d / 5.0) * 5) % 360))
 
     def _refresh_layer_tree(self):
@@ -937,7 +1010,7 @@ class App:
 
         self.tree.delete(*self.tree.get_children())
         sf, af = self._speed_factor(), self._alt_factor()
-        tree_font = tkfont.nametofont("TkDefaultFont")
+        tree_font = self.fonts.normal
         widest = {"seg": 0, "note": 0}
         for i, (a, b) in enumerate(zip(self.calm.segments, self.windy.segments)):
             alt = (self._num(round(b.alt_end / af)) if abs(b.alt_end - b.alt_start) < 0.5 else
@@ -958,17 +1031,17 @@ class App:
                 label,
                 "%.2f" % (b.distance_m / dfac) if b.distance_m else "",
                 alt,
-                "%03d" % round(b.course_deg) if b.course_deg is not None else "",
-                "%03d" % round(b.heading_deg) if b.heading_deg is not None else "",
+                ("%03d/%03d" % (round(b.course_deg) % 360, round(b.heading_deg) % 360)
+                 if b.course_deg is not None and b.heading_deg is not None else
+                 ("%03d" % round(b.course_deg) if b.course_deg is not None else "")),
                 wind_txt,
                 "%.0f" % (a.groundspeed / sf) if a.groundspeed else "",
                 "%.0f" % (b.groundspeed / sf) if b.groundspeed else ("—" if b.kind == "leg" else ""),
                 fmt_time(a.time_s), fmt_time(b.time_s), fmt_delta(dt) if abs(dt) >= 0.5 else "",
                 b.note), tags=tags)
         # Size the text columns to their longest entry so nothing is cut off.
-        for col, extra in (("seg", 28), ("note", 24)):
-            w = max(self.tree_heads[col][1], widest[col] + extra)
-            self.tree.column(col, width=w, minwidth=w if col == "seg" else 44)
+        self._text_widths = {"seg": widest["seg"] + 12, "note": widest["note"] + 12}
+        self._size_tree_columns()
         self.status.set("Calculated %d segments. Wind column: %s / from °. Speeds in %s, heights in %s above launch."
                         % (len(self.windy.segments), self.speed_unit.get(), self.speed_unit.get(),
                            self.alt_unit.get()))
@@ -1087,17 +1160,23 @@ class App:
             self._tile_images.popitem(last=False)
         return img
 
-    def _label(self, x, y, text, anchor="nw", font=("TkDefaultFont", 9), fg="#222222", bg="#ffffff", pad=3):
-        """Text on a white box so it stays readable over the map."""
-        c = self.canvas
-        t = c.create_text(x, y, text=text, anchor=anchor, font=font, fill=fg)
+    def _label(self, x, y, text, anchor="nw", font=None, pad=3):
+        """Text on a solid box so it stays readable over the map."""
+        c, p = self.canvas, self.pal
+        t = c.create_text(x, y, text=text, anchor=anchor, font=font or self.fonts.small, fill=p["overlay_fg"])
         x0, y0, x1, y1 = c.bbox(t)
-        r = c.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad, fill=bg, outline="#9aa3ad")
+        r = c.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad, fill=p["overlay_bg"],
+                               outline=p["overlay_border"])
         c.tag_lower(r, t)
         return x0 - pad, y0 - pad, x1 + pad, y1 + pad
 
+    def _box(self, x0, y0, x1, y1):
+        p = self.pal
+        return self.canvas.create_rectangle(x0, y0, x1, y1, fill=p["overlay_bg"], outline=p["overlay_border"])
+
     def draw_map(self):
-        c = self.canvas
+        c, p, F = self.canvas, self.pal, self.fonts
+        k = self.scale
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
         if w < 50 or h < 50:
@@ -1105,7 +1184,7 @@ class App:
         if not self.mission or not self.windy:
             c.create_text(w / 2, h / 2, text="Open a Mission Planner (.waypoints), QGroundControl (.plan),\n"
                                              "KML or KMZ flight plan to see the route here.",
-                          fill="#666666", justify="center", font=("TkDefaultFont", 11))
+                          fill=p["muted"], justify="center", font=F.normal)
             return
         if self._map_fitted_for != id(self.mission) or self.map_zoom is None:
             self.fit_map(redraw=False)
@@ -1130,72 +1209,83 @@ class App:
             return x - ox, y - oy
 
         mpp = basemap.metres_per_px(m.home_lat, z)
+        casing = "#ffffff" if provider else p["map_bg"]
 
-        # --- route (white casing under each line keeps it visible on any map)
+        # --- route (a casing under each line keeps it visible on any map)
         for a, b in zip(self.calm.segments, self.windy.segments):
             if b.start is None or b.end is None:
                 continue
             if b.loiter_radius:
                 x, y = scr(*b.start)
                 r = b.loiter_radius / mpp
-                c.create_oval(x - r, y - r, x + r, y + r, outline="#ffffff", width=5)
-                c.create_oval(x - r, y - r, x + r, y + r, outline="#7d3cb5", dash=(6, 4), width=3)
+                c.create_oval(x - r, y - r, x + r, y + r, outline=casing, width=5)
+                c.create_oval(x - r, y - r, x + r, y + r, outline="#9b59d0", dash=(6, 4), width=3)
                 continue
             if b.distance_m < 0.5:
                 continue
             ratio = b.time_s / a.time_s if a.time_s > 0 else 1.0
             color = COLOR_SLOWER if ratio > 1.03 else (COLOR_FASTER if ratio < 0.97 else COLOR_NEUTRAL)
             if not math.isfinite(b.time_s):
-                color = "#000000"
+                color = p["fg"]
             x0, y0 = scr(*b.start)
             x1, y1 = scr(*b.end)
-            c.create_line(x0, y0, x1, y1, fill="#ffffff", width=8, capstyle="round")
-            c.create_line(x0, y0, x1, y1, fill=color, width=4, arrow="last", arrowshape=(13, 16, 6))
+            c.create_line(x0, y0, x1, y1, fill=casing, width=8 * k, capstyle="round")
+            c.create_line(x0, y0, x1, y1, fill=color, width=4 * k, arrow="last",
+                          arrowshape=(13 * k, 16 * k, 6 * k))
 
+        dot = 5 * k
         for it in m.items:
             if it.has_position and it.command not in (M.DO_JUMP, M.DO_CHANGE_SPEED):
                 x, y = scr(it.lat, it.lon)
-                c.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#ffffff", outline="#222222", width=2)
-                self._label(x + 8, y - 8, str(it.seq), anchor="sw", font=("TkDefaultFont", 8, "bold"), pad=1)
+                c.create_oval(x - dot, y - dot, x + dot, y + dot, fill=p["overlay_bg"], outline=p["overlay_fg"],
+                              width=2)
+                self._label(x + dot + 3, y - dot - 3, str(it.seq), anchor="sw", font=F.small_bold, pad=1)
         hx, hy = scr(m.home_lat, m.home_lon)
-        c.create_polygon(hx, hy - 11, hx - 9, hy + 7, hx + 9, hy + 7, fill="#f2b134", outline="#5a3f00", width=2)
-        self._label(hx, hy + 10, "Launch", anchor="n", font=("TkDefaultFont", 8, "bold"), pad=1)
+        c.create_polygon(hx, hy - 11 * k, hx - 9 * k, hy + 7 * k, hx + 9 * k, hy + 7 * k, fill="#f2b134",
+                         outline="#5a3f00", width=2)
+        self._label(hx, hy + 10 * k, "Launch", anchor="n", font=F.small_bold, pad=1)
 
-        # --- overlays: legend, north, wind, scale, attribution
-        font = tkfont.Font(family=tkfont.nametofont("TkDefaultFont").cget("family"), size=9)
-        lx, ly, lh = 10, 10, 22
-        box = c.create_rectangle(lx, ly, lx, ly + lh, fill="#ffffff", outline="#9aa3ad")
+        # --- overlays: legend, north, wind, scale, attribution (sized from the font height)
+        line = F.line(F.small)
+        lx, ly, lh = 10, 10, line + 8
+        box = self._box(lx, ly, lx, ly + lh)
         x = lx + 6
-        c.create_text(x, ly + lh / 2, text="Legs:", anchor="w", font=("TkDefaultFont", 9, "bold"))
-        x += font.measure("Legs:") + 12
+        c.create_text(x, ly + lh / 2, text="Legs:", anchor="w", font=F.small_bold, fill=p["overlay_fg"])
+        x += F.small_bold.measure("Legs:") + 12
         for col, txt in ((COLOR_SLOWER, "slower with wind"), (COLOR_FASTER, "faster"),
                          (COLOR_NEUTRAL, "little change")):
-            c.create_line(x, ly + lh / 2, x + 18, ly + lh / 2, fill=col, width=4)
-            x += 23
-            c.create_text(x, ly + lh / 2, text=txt, anchor="w", font=font)
-            x += font.measure(txt) + 14
+            c.create_line(x, ly + lh / 2, x + 18 * k, ly + lh / 2, fill=col, width=4 * k)
+            x += 18 * k + 5
+            c.create_text(x, ly + lh / 2, text=txt, anchor="w", font=F.small, fill=p["overlay_fg"])
+            x += F.small.measure(txt) + 14
         c.coords(box, lx, ly, x - 6, ly + lh)
 
-        c.create_oval(w - 38, 8, w - 8, 38, fill="#ffffff", outline="#9aa3ad")
-        c.create_line(w - 23, 33, w - 23, 15, arrow="last", width=2, arrowshape=(7, 8, 3))
-        c.create_text(w - 23, 44, text="N", font=("TkDefaultFont", 9, "bold"), anchor="n")
+        nr = 15 * k
+        ncx, ncy = w - 8 - nr, 8 + nr
+        c.create_oval(ncx - nr, ncy - nr, ncx + nr, ncy + nr, fill=p["overlay_bg"], outline=p["overlay_border"])
+        c.create_line(ncx, ncy + nr * 0.65, ncx, ncy - nr * 0.65, arrow="last", width=2, fill=p["overlay_fg"],
+                      arrowshape=(7 * k, 8 * k, 3 * k))
+        self._label(ncx, ncy + nr + 4, "N", anchor="n", font=F.small_bold, pad=1)
+        below_north = ncy + nr + line + 12
 
         nice = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000]
         target = (w * 0.18) * mpp
         seg_m = max([v for v in nice if v <= target] or [nice[0]])
         px = seg_m / mpp
         sb_text = ("%g km" % (seg_m / 1000)) if seg_m >= 1000 else "%d m" % seg_m
-        c.create_rectangle(6, h - 30, 22 + px + font.measure(sb_text) + 8, h - 6, fill="#ffffff", outline="#9aa3ad")
-        c.create_line(12, h - 18, 12 + px, h - 18, width=4, fill="#333333")
-        c.create_line(12, h - 23, 12, h - 13, width=2, fill="#333333")
-        c.create_line(12 + px, h - 23, 12 + px, h - 13, width=2, fill="#333333")
-        c.create_text(18 + px, h - 18, anchor="w", font=("TkDefaultFont", 8), text=sb_text)
+        sb_h = line + 10
+        sy = h - 6 - sb_h / 2
+        self._box(6, h - 6 - sb_h, 22 + px + F.small.measure(sb_text) + 8, h - 6)
+        c.create_line(12, sy, 12 + px, sy, width=4, fill=p["overlay_fg"])
+        c.create_line(12, sy - 5, 12, sy + 5, width=2, fill=p["overlay_fg"])
+        c.create_line(12 + px, sy - 5, 12 + px, sy + 5, width=2, fill=p["overlay_fg"])
+        c.create_text(18 + px, sy, anchor="w", font=F.small, text=sb_text, fill=p["overlay_fg"])
 
         if provider:
             attr = basemap.PROVIDERS[provider]["attribution"]
             if self.tiles.errors and not self.tiles.successes and not self._tile_images:
                 attr = "Base map unavailable (offline?) · " + attr
-            self._label(w - 4, h - 4, attr, anchor="se", font=("TkDefaultFont", 8), pad=2)
+            self._label(w - 4, h - 4, attr, anchor="se", font=F.small, pad=2)
 
         try:
             wind = self.read_wind()
@@ -1204,16 +1294,16 @@ class App:
         if wind and not wind.is_calm():
             s, d = wind.at(self._typical_alt())
             text = "Wind %.0f %s from %03d°" % (s / self._speed_factor(), self.speed_unit.get(), round(d) % 360)
-            bw = max(font.measure(text) + 16, 90)
-            bx1, by0 = w - 8, 70
-            bx0, by1 = bx1 - bw, by0 + 80
-            c.create_rectangle(bx0, by0, bx1, by1, fill="#ffffff", outline="#9aa3ad")
-            ax, ay = (bx0 + bx1) / 2, by0 + 34
+            L = 22 * k
+            bw = max(F.small_bold.measure(text) + 16, 2 * L + 30)
+            bx1, by0 = w - 8, below_north
+            bx0, by1 = bx1 - bw, by0 + 2 * L + 16 + F.line(F.small_bold)
+            self._box(bx0, by0, bx1, by1)
+            ax, ay = (bx0 + bx1) / 2, by0 + 8 + L
             a = math.radians(d + 180)
-            L = 24
             c.create_line(ax - L * math.sin(a), ay + L * math.cos(a), ax + L * math.sin(a), ay - L * math.cos(a),
-                          arrow="last", width=5, fill=COLOR_NEUTRAL, arrowshape=(13, 16, 7))
-            c.create_text(ax, by1 - 6, text=text, anchor="s", font=("TkDefaultFont", 9, "bold"))
+                          arrow="last", width=5 * k, fill=COLOR_NEUTRAL, arrowshape=(13 * k, 16 * k, 7 * k))
+            c.create_text(ax, by1 - 5, text=text, anchor="s", font=F.small_bold, fill=p["overlay_fg"])
 
     # ------------------------------------------------------------------ export / help
     def export_csv(self):
@@ -1287,6 +1377,8 @@ class App:
                 self.wind_speed.set(s.get("wind_speed", self.wind_speed.get()))
                 self.kml_alt.set(s.get("kml_alt", self.kml_alt.get()))
             self.wind_dir.set(s.get("wind_dir", self.wind_dir.get()))
+            if s.get("appearance") in theme.APPEARANCES:
+                self.appearance.set(s["appearance"])
             if s.get("map_provider") in list(basemap.PROVIDERS) + [basemap.NO_MAP]:
                 self.map_provider.set(s["map_provider"])
             self.kml_takeoff.set(s.get("kml_takeoff", True))
@@ -1300,6 +1392,7 @@ class App:
 
     def _save_settings(self):
         s = {"settings_version": SETTINGS_VERSION, "map_provider": self.map_provider.get(),
+             "appearance": self.appearance.get(),
              "speed_unit": self.speed_unit.get(), "alt_unit": self.alt_unit.get(),
              "wind_speed": self.wind_speed.get(), "wind_dir": self.wind_dir.get(),
              "kml_alt": self.kml_alt.get(), "kml_takeoff": self.kml_takeoff.get(), "kml_rtl": self.kml_rtl.get(),

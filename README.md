@@ -22,6 +22,10 @@ A desktop app that estimates how long a **fixed-wing** or **VTOL (QuadPlane)** m
   * A per-leg table showing course, heading (crab angle), ground speed and time. Export it to CSV.
   * A route map on an open-source base map (**OpenStreetMap** or **OpenTopoMap** terrain). Each leg
     is coloured red if the wind slows it down and green if it speeds it up. Scroll to zoom, drag to pan.
+* **Light, dark or system appearance**: choose it on the *Options* tab or the *View* menu. *System*
+  follows your computer's light/dark setting, even while the app is open.
+* **Readable at any display scaling** (Windows 125–200%, Retina/HiDPI screens): table rows, columns and
+  controls are sized from the actual font.
 * **Metric units by default** (km/h, metres, km). Knots, mph, m/s and feet can be chosen on the
   *Options* tab.
 
@@ -105,6 +109,7 @@ flighttime/
   wind.py       wind profile and wind-triangle maths
   weather.py    Open-Meteo and NOAA METAR clients
   basemap.py    OpenStreetMap / OpenTopoMap tile download and cache
+  theme.py      light / dark appearance and DPI-aware sizing
   aircraft.py   aircraft performance profiles and presets
   gui.py        Tkinter user interface
 examples/       sample missions to try
