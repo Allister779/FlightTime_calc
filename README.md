@@ -41,7 +41,9 @@ Standalone builds are made automatically by GitHub Actions for each operating sy
 | Linux x86-64 | `FlightTimeCalc-linux-x86_64` | `chmod +x FlightTimeCalc-linux-x86_64` then run it. |
 
 To make a downloadable release, push a version tag (for example `git tag v1.0.0 && git push --tags`).
-The builds are then attached to a GitHub Release automatically.
+The builds are then attached to a GitHub Release automatically. You can also run the
+*Build standalone apps* workflow by hand from the **Actions** tab and enter a tag (for example `v1.2.1`)
+in *release_tag*; GitHub then creates the tag and the release itself.
 
 ## Run from source
 

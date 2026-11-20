@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Create a GitHub Release with this tag (e.g. v1.2.0). Leave empty to only build."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -58,10 +63,28 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: out/${{ matrix.asset }}
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - run: ls -la out
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: FlightTime Calc ${{ github.ref_name }}
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: FlightTime Calc ${{ inputs.release_tag || github.ref_name }}
           body_path: RELEASE_NOTES.md
-          files: out/${{ matrix.asset }}
+          fail_on_unmatched_files: true
+          files: |
+            out/FlightTimeCalc-windows-x64.exe
+            out/FlightTimeCalc-macos-apple-silicon.zip
+            out/FlightTimeCalc-macos-intel.zip
+            out/FlightTimeCalc-linux-x86_64
